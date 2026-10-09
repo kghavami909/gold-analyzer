@@ -50,18 +50,13 @@ def save_snapshot_cache(snapshot: dict):
 
 def fetch_gold_data(period: str = "60d", interval: str = "1h") -> pd.DataFrame:
     """
-    Fetch XAU/USD OHLCV data via yfinance.
-    
-    period:   '1d','5d','7d','30d','60d','90d','1y'
-    interval: '1m','5m','15m','30m','1h','4h','1d'
+    Fetch XAU/USD OHLCV data via yfinance, with robust fallback to KuCoin PAXG.
     """
     try:
-        ticker = yf.Ticker("GC=F")          # Gold Futures (tracks XAU/USD closely)
+        ticker = yf.Ticker("GC=F")
         df = ticker.history(period=period, interval=interval)
         if df.empty:
-            # fallback to spot gold ETF (GLD)
-            ticker = yf.Ticker("GLD")
-            df = ticker.history(period=period, interval=interval)
+            raise Exception("yfinance returned empty")
         df.index = pd.to_datetime(df.index)
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
@@ -70,7 +65,24 @@ def fetch_gold_data(period: str = "60d", interval: str = "1h") -> pd.DataFrame:
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         return df
     except Exception as e:
-        print(f"[DataFetcher] Error fetching gold data: {e}")
+        print(f"[DataFetcher] yfinance failed ({e}), falling back to KuCoin API...")
+        try:
+            # KuCoin interval mapping
+            kc_map = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1hour", "4h": "4hour", "1d": "1day"}
+            kc_int = kc_map.get(interval, "1hour")
+            url = f"https://api.kucoin.com/api/v1/market/candles?type={kc_int}&symbol=PAXG-USDT"
+            res = requests.get(url, timeout=5)
+            data = res.json()
+            if data.get("code") == "200000":
+                df = pd.DataFrame(data["data"], columns=["timestamp", "Open", "Close", "High", "Low", "Volume", "Turnover"])
+                df["timestamp"] = pd.to_numeric(df["timestamp"])
+                df.index = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+                for col in ["Open", "Close", "High", "Low", "Volume"]:
+                    df[col] = pd.to_numeric(df[col])
+                df = df.sort_index()
+                return df[["Open", "High", "Low", "Close", "Volume"]]
+        except Exception as ke:
+            print(f"[DataFetcher] KuCoin fallback also failed: {ke}")
         return pd.DataFrame()
 
 
@@ -79,6 +91,8 @@ def fetch_gold_daily(days: int = 120) -> pd.DataFrame:
     try:
         ticker = yf.Ticker("GC=F")
         df = ticker.history(period=f"{days}d", interval="1d")
+        if df.empty:
+            raise Exception("yfinance daily empty")
         df.index = pd.to_datetime(df.index)
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
@@ -87,7 +101,21 @@ def fetch_gold_daily(days: int = 120) -> pd.DataFrame:
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         return df
     except Exception as e:
-        print(f"[DataFetcher] Error fetching daily gold: {e}")
+        print(f"[DataFetcher] Error fetching daily gold via yf ({e}), trying KuCoin fallback...")
+        try:
+            url = "https://api.kucoin.com/api/v1/market/candles?type=1day&symbol=PAXG-USDT"
+            res = requests.get(url, timeout=5)
+            data = res.json()
+            if data.get("code") == "200000":
+                df = pd.DataFrame(data["data"], columns=["timestamp", "Open", "Close", "High", "Low", "Volume", "Turnover"])
+                df["timestamp"] = pd.to_numeric(df["timestamp"])
+                df.index = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+                for col in ["Open", "Close", "High", "Low", "Volume"]:
+                    df[col] = pd.to_numeric(df[col])
+                df = df.sort_index()
+                return df[["Open", "High", "Low", "Close", "Volume"]]
+        except Exception as ke:
+            print(f"[DataFetcher] KuCoin daily fallback failed: {ke}")
         return pd.DataFrame()
 
 
@@ -95,15 +123,31 @@ def fetch_current_price() -> dict:
     """
     دریافت قیمت لحظه‌ای و واقعی طلا (XAU/USD).
     ترتیب بررسی منابع:
-      ۱. API زنده Gold-API Spot
-      ۲. GoldPrice.org Feed
-      ۳. Paxos Gold (PAXG 1:1 Gold Spot با آپدیت میلی‌ثانیه‌ای)
-      ۴. Yahoo Finance XAUUSD=X (Spot Forex)
-      ۵. Yahoo Finance GC=F (COMEX Futures)
+      ۱. KuCoin PAXG (Global Cloud Safe — بدون بلاک و تحریم)
+      ۲. API زنده Gold-API Spot
+      ۳. Paxos Gold Binance
+      ۴. GoldPrice.org Feed
+      ۵. Yahoo Finance GC=F
     """
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # منبع ۱: Gold-API Spot (بسیار دقیق و آنی)
+    # منبع ویژه بدون تحریم و بلاک کلود: KuCoin PAXG
+    try:
+        r = requests.get("https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=PAXG-USDT", headers=headers, timeout=2.0)
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("code") == "200000" and d.get("data"):
+                p = float(d["data"].get("price", 0))
+                if 1500 < p < 6000:
+                    return {
+                        "price": round(p, 2),
+                        "timestamp": datetime.now(pytz.UTC).isoformat(),
+                        "source": "KuCoin PAXG (Global Cloud Safe)"
+                    }
+    except Exception:
+        pass
+
+    # منبع ۲: Gold-API Spot (بسیار دقیق و آنی)
     try:
         r = requests.get("https://api.gold-api.com/price/XAU", headers=headers, timeout=2.0)
         if r.status_code == 200:
@@ -118,7 +162,7 @@ def fetch_current_price() -> dict:
     except Exception:
         pass
 
-    # منبع ۲: Paxos Gold (بر پایه طلای فیزیکی ۱ به ۱ - ۲۴ ساعته بدون وقفه)
+    # منبع ۳: Paxos Gold (بر پایه طلای فیزیکی ۱ به ۱)
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", headers=headers, timeout=2.0)
         if r.status_code == 200:
@@ -190,11 +234,23 @@ def fetch_live_price_fast() -> float | None:
     فقط عدد قیمت لحظه‌ای — سریع‌ترین راه ممکن برای به‌روزرسانی هدر و نمودار.
     """
     headers = {"User-Agent": "Mozilla/5.0"}
-    
+
+    # منبع فوق‌سریع بدون بلاک کلود: KuCoin
+    try:
+        r = requests.get("https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=PAXG-USDT", headers=headers, timeout=1.5)
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("code") == "200000" and d.get("data"):
+                val = float(d["data"].get("price", 0))
+                if 1500 < val < 6000:
+                    return round(val, 2)
+    except Exception:
+        pass
+
     # تست سریع Paxos Gold یا Gold-API (کمتر از ۱ ثانیه)
-    for url, key, subkey in [
-        ("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", "price", None),
-        ("https://api.gold-api.com/price/XAU", "price", None),
+    for url, key in [
+        ("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", "price"),
+        ("https://api.gold-api.com/price/XAU", "price"),
     ]:
         try:
             r = requests.get(url, headers=headers, timeout=1.5)

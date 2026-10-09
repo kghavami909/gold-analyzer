@@ -51,7 +51,7 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 
-from modules.data_fetcher import get_cached_snapshot, get_full_market_snapshot, fetch_current_price
+from modules.data_fetcher import get_cached_snapshot, get_full_market_snapshot, fetch_current_price, fetch_live_price_fast
 from modules.signal_generator import generate_signal
 from modules.session_analyzer import full_session_report, get_current_session
 from modules.weekly_tracker import get_weekly_report, update_weekly_signal_statuses
@@ -199,6 +199,13 @@ def get_status():
     current_p = _STATE.get("last_price")
     if not current_p and (snap.get("current") or {}).get("price"):
         current_p = snap["current"]["price"]
+    if not current_p:
+        try:
+            current_p = fetch_live_price_fast()
+            if current_p:
+                _STATE["last_price"] = current_p
+        except Exception:
+            pass
 
     weekly_rep = get_weekly_report()
     
@@ -295,9 +302,12 @@ def force_refresh():
 
 @app.get("/", response_class=HTMLResponse)
 def index_html():
-    _template_path = os.path.join(_DIR, "ui_template.html")
-    with open(_template_path, "r", encoding="utf-8") as f:
-        return f.read()
+    for name in ["ui_template.html", "index.html"]:
+        _path = os.path.join(_DIR, name)
+        if os.path.exists(_path):
+            with open(_path, "r", encoding="utf-8") as f:
+                return f.read()
+    return "<h1>Gold Analyzer: ui_template.html not found</h1>"
 
 
 def print_banner(ips, port):
